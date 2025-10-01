@@ -16,4 +16,4 @@ SQLAlchemy==2.0.43
 typing_extensions==4.15.0
 yarl==1.20.1
 psycopg[binary]==3.1.19
-
+psycopg2
