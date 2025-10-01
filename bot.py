@@ -170,17 +170,27 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 def dupe_match_exists(session, game_id: int, a_id: int, b_id: int, window_minutes=5) -> Optional[int]:
+    """
+    See if a match between the same two players (any order) for same game
+    was reported in the last `window_minutes`. Return the most recent match id if found.
+    """
     since = now_utc() - timedelta(minutes=window_minutes)
-    stmt = select(Match.id).where(
-        Match.game_id == game_id,
-        Match.played_at >= since,
-        Match.voided == False,
-        or_(
-            and_(Match.winner_id == a_id, Match.loser_id == b_id),
-            and_(Match.winner_id == b_id, Match.loser_id == a_id),
+    stmt = (
+        select(Match.id)
+        .where(
+            Match.game_id == game_id,
+            Match.played_at >= since,
+            Match.voided == False,
+            or_(
+                and_(Match.winner_id == a_id, Match.loser_id == b_id),
+                and_(Match.winner_id == b_id, Match.loser_id == a_id),
+            ),
         )
-    ).order_by(Match.id.desc())
-    return session.execute(stmt).scalar_one_or_none()
+        .order_by(Match.id.desc())
+        .limit(1)  # <-- ensure at most one row
+    )
+    return session.execute(stmt).scalars().first()
+
 
 # ------------- Bot -------------
 class RecordsBot(commands.Bot):
