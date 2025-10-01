@@ -7,7 +7,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
-
+from sqlalchemy.engine import make_url
 from sqlalchemy import (
     Column, Integer, String, DateTime, Boolean,
     ForeignKey, create_engine, func, select, and_, or_
@@ -26,15 +26,30 @@ INTENTS = discord.Intents.default()
 # ------------- DB Setup -------------
 Base = declarative_base()
 
-DB_URL = os.getenv("DATABASE_URL")  # set on Heroku
+DB_URL = os.getenv("DATABASE_URL")  # set by Heroku
+
 if DB_URL:
-    # Normalize Heroku URL + ensure SSL
+    # Convert legacy/postgres URLs to psycopg v3 driver
     if DB_URL.startswith("postgres://"):
         DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
-    if "sslmode=" not in DB_URL:
-        DB_URL += ("&" if "?" in DB_URL else "?") + "sslmode=require"
+
+    url = make_url(DB_URL)
+    # Force psycopg v3 driver if none/psycopg2 was implied
+    if url.get_backend_name() == "postgresql" and url.get_driver_name() in (None, "", "psycopg2"):
+        url = url.set(drivername="postgresql+psycopg")
+
+    # Ensure SSL on Heroku
+    query = dict(url.query)
+    if query.get("sslmode") is None:
+        query["sslmode"] = "require"
+    url = url.set(query=query)
+
+    DB_URL = str(url)
     engine = create_engine(DB_URL, echo=False, future=True)
 else:
+    # Guard: don’t silently use SQLite on Heroku dynos
+    if os.getenv("DYNO"):
+        raise RuntimeError("On Heroku but DATABASE_URL is missing. Add Heroku Postgres.")
     engine = create_engine("sqlite:///records.db", echo=False, future=True)
 
 SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False, autocommit=False))
