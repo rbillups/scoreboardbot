@@ -99,22 +99,21 @@ class AuditLog(Base):
 Base.metadata.create_all(engine)
 
 # ------------- Helpers -------------
+def _norm_code(s: str) -> str:
+    """Normalize to a lowercase, no-space short code (e.g., 'M a d d e n' -> 'madden')."""
+    return "".join(str(s).lower().split())
+
 def upsert_user(session, member: discord.abc.User) -> User:
     """Create or update a User row, safely handling multiple references to the same user in one transaction."""
-    # Prefer display_name/global_name if available, else fall back to name
     name = getattr(member, "display_name", None) or getattr(member, "global_name", None) or member.name
 
-    # 1) Query identity map / DB
     u = session.get(User, member.id)
-
-    # 2) If not found, check pending new objects in this session (prevents duplicate INSERTs)
     if u is None:
         for obj in session.new:
             if isinstance(obj, User) and obj.id == member.id:
                 u = obj
                 break
 
-    # 3) Create if still missing; flush so the PK is registered and future lookups work
     if u is None:
         u = User(id=member.id, display_name=name)
         session.add(u)
@@ -128,17 +127,18 @@ def upsert_user(session, member: discord.abc.User) -> User:
 def get_or_create_game(session, name_or_code: Optional[str]) -> Optional[Game]:
     if not name_or_code:
         return None
-    q = session.execute(
-        select(Game).where(func.lower(Game.short_code) == name_or_code.lower())
-    ).scalar_one_or_none()
+    raw = name_or_code.strip()
+    code = _norm_code(raw)  # lowercase, no spaces
+    # First try exact short_code match
+    q = session.execute(select(Game).where(func.lower(Game.short_code) == code)).scalar_one_or_none()
     if q:
         return q
-    q = session.execute(
-        select(Game).where(func.lower(Game.name) == name_or_code.lower())
-    ).scalar_one_or_none()
+    # Then try case-insensitive name match
+    q = session.execute(select(Game).where(func.lower(Game.name) == raw.lower())).scalar_one_or_none()
     if q:
         return q
-    g = Game(name=name_or_code.title(), short_code=name_or_code.lower().replace(" ", ""))
+    # Create new with normalized short_code and nice title name
+    g = Game(name=raw.title(), short_code=code)
     session.add(g)
     session.flush()
     return g
@@ -170,10 +170,7 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 def dupe_match_exists(session, game_id: int, a_id: int, b_id: int, window_minutes=5) -> Optional[int]:
-    """
-    See if a match between the same two players (any order) for same game
-    was reported in the last `window_minutes`. Return the most recent match id if found.
-    """
+    """Return most recent duplicate match id within window, if any."""
     since = now_utc() - timedelta(minutes=window_minutes)
     stmt = (
         select(Match.id)
@@ -187,10 +184,9 @@ def dupe_match_exists(session, game_id: int, a_id: int, b_id: int, window_minute
             ),
         )
         .order_by(Match.id.desc())
-        .limit(1)  # <-- ensure at most one row
+        .limit(1)
     )
     return session.execute(stmt).scalars().first()
-
 
 # ------------- Bot -------------
 class RecordsBot(commands.Bot):
@@ -319,32 +315,29 @@ async def record(
         g = get_or_create_game(session, game) if game else None
         add_filters = season_filter_clause(g.id if g else None, season)
 
-        stmt = select(Match).where(Match.voided == False, Match.verified == True)
-        stmt = add_filters(stmt)
+        base = select(Match).where(Match.verified == True, Match.voided == False)
+        base = add_filters(base)
+        base_sub = base.subquery()
 
         def wl_for(uid: int, vs_uid: Optional[int]) -> Tuple[int, int]:
-            s2 = stmt
+            s2 = select(base_sub)
             if vs_uid:
                 s2 = s2.where(or_(
-                    and_(Match.winner_id == uid, Match.loser_id == vs_uid),
-                    and_(Match.winner_id == vs_uid, Match.loser_id == uid),
+                    and_(base_sub.c.winner_id == uid, base_sub.c.loser_id == vs_uid),
+                    and_(base_sub.c.winner_id == vs_uid, base_sub.c.loser_id == uid),
                 ))
+            s2_sub = s2.subquery()
             wins = session.execute(
-                select(func.count()).select_from(s2.subquery()).where(Match.winner_id == uid)
+                select(func.count()).select_from(s2_sub).where(s2_sub.c.winner_id == uid)
             ).scalar()
             losses = session.execute(
-                select(func.count()).select_from(s2.subquery()).where(Match.loser_id == uid)
+                select(func.count()).select_from(s2_sub).where(s2_sub.c.loser_id == uid)
             ).scalar()
             return wins or 0, losses or 0
 
         if user and vs:
-            # Dedupe potential duplicates (in case user==vs)
-            unique_members = {}
-            unique_members[user.id] = user
-            unique_members[vs.id] = vs
-            for m in unique_members.values():
+            for m in {user.id: user, vs.id: vs}.values():
                 upsert_user(session, m)
-
             u1 = session.get(User, user.id)
             u2 = session.get(User, vs.id)
             w, l = wl_for(u1.id, u2.id)
@@ -365,12 +358,12 @@ async def record(
                 ephemeral=True
             )
         else:
-            base = stmt
+            # Top 10 leaderboard
             wins_by = session.execute(
-                select(Match.winner_id, func.count().label("w")).select_from(base.subquery()).group_by(Match.winner_id)
+                select(base_sub.c.winner_id, func.count().label("w")).select_from(base_sub).group_by(base_sub.c.winner_id)
             ).all()
             losses_by = session.execute(
-                select(Match.loser_id, func.count().label("l")).select_from(base.subquery()).group_by(Match.loser_id)
+                select(base_sub.c.loser_id, func.count().label("l")).select_from(base_sub).group_by(base_sub.c.loser_id)
             ).all()
             w_map = {row[0]: row[1] for row in wins_by}
             l_map = {row[0]: row[1] for row in losses_by}
@@ -412,6 +405,16 @@ async def head2head(
     season: Optional[str] = None
 ):
     await record.callback(interaction, game=game, user=user1, vs=user2, season=season)
+
+# ----- New: Leaderboard -----
+@bot.tree.command(name="leaderboard", description="Show the top 10 players by record.")
+@app_commands.describe(game="Game name/code (optional)", season="Season filter (optional)")
+async def leaderboard(
+    interaction: discord.Interaction,
+    game: Optional[str] = None,
+    season: Optional[str] = None
+):
+    await record.callback(interaction, game=game, user=None, vs=None, season=season)
 
 # ----- Seasons -----
 
@@ -492,6 +495,71 @@ async def season_reset(interaction: discord.Interaction, name: str):
     finally:
         session.close()
 
+# ----- New: matchup reset (admin) -----
+@bot.tree.command(name="matchup_reset", description="Admin: reset a head-to-head to 0–0 for a game (optional season).")
+@app_commands.describe(
+    user1="Player 1",
+    user2="Player 2",
+    game="Game name/code",
+    season="Season name (optional)"
+)
+async def matchup_reset(
+    interaction: discord.Interaction,
+    user1: discord.User,
+    user2: discord.User,
+    game: str,
+    season: Optional[str] = None
+):
+    try:
+        require_admin(interaction)
+    except Exception as e:
+        return await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    session = SessionLocal()
+    try:
+        g = get_or_create_game(session, game)
+        s = find_active_season(session, season, g) if season else None
+
+        # Ensure users exist in DB (names updated)
+        for m in {user1.id: user1, user2.id: user2}.values():
+            upsert_user(session, m)
+
+        q = session.query(Match).filter(
+            Match.game_id == g.id,
+            Match.voided == False,
+            or_(
+                and_(Match.winner_id == user1.id, Match.loser_id == user2.id),
+                and_(Match.winner_id == user2.id, Match.loser_id == user1.id),
+            )
+        )
+        if s:
+            q = q.filter(Match.season_id == s.id)
+
+        # Soft-reset: mark as voided so history is preserved but excluded from stats
+        count = 0
+        for m in q.all():
+            m.voided = True
+            count += 1
+
+        session.add(AuditLog(
+            who_id=interaction.user.id,
+            action=f"matchup_reset {user1.id}<->{user2.id} in {g.short_code}" + (f" season {s.name}" if s else "")
+        ))
+        session.commit()
+
+        label = f"{g.name}" + (f" — {s.name}" if s else "")
+        await interaction.followup.send(
+            f"🧹 Reset head-to-head for **{user1.display_name}** vs **{user2.display_name}** in **{label}**. "
+            f"Voided **{count}** matches. Now 0–0.",
+            ephemeral=True
+        )
+    except Exception as e:
+        session.rollback()
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+    finally:
+        session.close()
+
 # ----- Undo -----
 
 @bot.tree.command(name="undo", description="Undo your last report (within 10 minutes).")
@@ -531,16 +599,18 @@ async def help_cmd(interaction: discord.Interaction):
         "• **/record** `[game] [user] [vs] [season]` — leaderboards, player record, or head-to-head\n"
         "• **/head2head** `user1:@User user2:@User [game] [season]` — quick H2H\n"
         "• **/leaderboard** `[game] [season]` — top 10\n\n"
+        "### 🧹 Admin Utilities\n"
+        "• **/undo** — players: undo your last report (10 min). Admins: undo latest match.\n"
+        "• **/matchup_reset** `user1:@User user2:@User game:<name> [season]` — reset a rivalry to 0–0 for a game.\n\n"
         "### 📅 Seasons (Admin Only)\n"
         "• **/season_start** `name:<name> [game]`\n"
         "• **/season_end** `name:<name>`\n"
         "• **/season_reset** `name:<name>`\n\n"
-        "### 🔄 Utilities\n"
-        "• **/undo** — players: undo your last report (10 min). Admins: undo latest match.\n\n"
         "### ℹ️ Notes\n"
+        "• Game names are case-insensitive and whitespace-insensitive (e.g., `Madden`, `madden`, `M a d d e n` are the same).\n"
         "• Replies are **ephemeral** by default.\n"
         "• Admins are the user IDs in the bot config (`ADMINS`).\n"
-        "• Very fast dupe-detection flags back-to-back identical reports.\n"
+        "• Quick dupe-detection flags back-to-back identical reports.\n"
     )
     await interaction.response.send_message(text, ephemeral=True)
 
