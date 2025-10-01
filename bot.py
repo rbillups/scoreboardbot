@@ -214,6 +214,7 @@ async def on_ready():
 
 # ----- Slash Commands -----
 
+# Public: /report (silent dupe detection, log-only)
 @bot.tree.command(name="report", description="Record a match result (win/loss).")
 @app_commands.describe(
     game="Game name or code (e.g., 'madden')",
@@ -233,36 +234,30 @@ async def report(
     season: Optional[str] = None
 ):
     if winner.id == loser.id:
-        return await interaction.response.send_message("Winner and loser must be different users.", ephemeral=True)
+        return await interaction.response.send_message("Winner and loser must be different users.")
 
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
     session = SessionLocal()
 
     try:
         g = get_or_create_game(session, game)
 
-        # Deduplicate reporter/winner/loser to avoid duplicate INSERTs in one txn
-        unique_members = {
-            interaction.user.id: interaction.user,
-            winner.id: winner,
-            loser.id: loser,
-        }
-        for m in unique_members.values():
+        # Ensure users exist / names updated (dedup across reporter/winner/loser)
+        for m in {interaction.user.id: interaction.user, winner.id: winner, loser.id: loser}.values():
             upsert_user(session, m)
 
-        # Now fetch the three rows reliably
         u_reporter = session.get(User, interaction.user.id)
         u_winner   = session.get(User, winner.id)
         u_loser    = session.get(User, loser.id)
 
-        # If both scores provided and appear reversed, auto-correct.
+        # Auto-correct reversed scores
         if score_w is not None and score_l is not None and score_w < score_l:
             score_w, score_l = score_l, score_w
             u_winner, u_loser = u_loser, u_winner
 
         s = find_active_season(session, season, g) if season else None
 
-        # Silent dupe check (log only)
+        # Silent dupe check (log-only)
         dupe = dupe_match_exists(session, g.id, u_winner.id, u_loser.id)
 
         m = Match(
@@ -279,7 +274,6 @@ async def report(
         )
         session.add(m)
 
-        # Audit log includes dupe reference if applicable; no user-facing banner.
         action = f"report match {u_winner.display_name} vs {u_loser.display_name} in {g.short_code}"
         if dupe:
             action += f" [dupe_of:{dupe}]"
@@ -290,16 +284,16 @@ async def report(
         label = f"{g.name}" + (f" — {s.name}" if s else "")
         score_txt = f" {m.score_w}-{m.score_l}" if (m.score_w is not None and m.score_l is not None) else ""
         await interaction.followup.send(
-            f"✅ Recorded: **{u_winner.display_name}** beat **{u_loser.display_name}**{score_txt} in **{label}**. Match ID: `{m.id}`",
-            ephemeral=True
+            f"✅ Recorded: **{u_winner.display_name}** beat **{u_loser.display_name}**{score_txt} in **{label}**. Match ID: `{m.id}`"
         )
     except Exception as e:
         session.rollback()
-        await interaction.followup.send(f"❌ Error recording match: {e}", ephemeral=True)
+        await interaction.followup.send(f"❌ Error recording match: {e}")
     finally:
         session.close()
 
-@bot.tree.command(name="record", description="Show a player's record, or overall for a game.")
+# Public: /record (player, h2h, or leaderboard if no user given)
+@bot.tree.command(name="record", description="Show a player's record, head-to-head, or a top-10 leaderboard.")
 @app_commands.describe(
     game="Game name/code (optional)",
     user="Player to summarize (optional)",
@@ -313,62 +307,80 @@ async def record(
     vs: Optional[discord.User] = None,
     season: Optional[str] = None
 ):
-    await interaction.response.defer(ephemeral=True)
+    # Public response
+    await interaction.response.defer()
     session = SessionLocal()
     try:
         g = get_or_create_game(session, game) if game else None
         add_filters = season_filter_clause(g.id if g else None, season)
 
+        # Base scope: verified & not voided, plus optional game/season filters
         base = select(Match).where(Match.verified == True, Match.voided == False)
         base = add_filters(base)
         base_sub = base.subquery()
 
         def wl_for(uid: int, vs_uid: Optional[int]) -> Tuple[int, int]:
-            s2 = select(base_sub)
             if vs_uid:
-                s2 = s2.where(or_(
-                    and_(base_sub.c.winner_id == uid, base_sub.c.loser_id == vs_uid),
-                    and_(base_sub.c.winner_id == vs_uid, base_sub.c.loser_id == uid),
-                ))
-            s2_sub = s2.subquery()
-            wins = session.execute(
-                select(func.count()).select_from(s2_sub).where(s2_sub.c.winner_id == uid)
-            ).scalar()
-            losses = session.execute(
-                select(func.count()).select_from(s2_sub).where(s2_sub.c.loser_id == uid)
-            ).scalar()
-            return wins or 0, losses or 0
+                wins = session.execute(
+                    select(func.count())
+                    .select_from(base_sub)
+                    .where(
+                        base_sub.c.winner_id == uid,
+                        base_sub.c.loser_id == vs_uid,
+                    )
+                ).scalar()
+                losses = session.execute(
+                    select(func.count())
+                    .select_from(base_sub)
+                    .where(
+                        base_sub.c.winner_id == vs_uid,
+                        base_sub.c.loser_id == uid,
+                    )
+                ).scalar()
+            else:
+                wins = session.execute(
+                    select(func.count()).select_from(base_sub).where(base_sub.c.winner_id == uid)
+                ).scalar()
+                losses = session.execute(
+                    select(func.count()).select_from(base_sub).where(base_sub.c.loser_id == uid)
+                ).scalar()
+            return (wins or 0), (losses or 0)
+
+        g_label = g.name if g else "All Games"
+        s_label = f", Season: {season}" if season else ""
 
         if user and vs:
+            # Ensure names exist/are up to date
             for m in {user.id: user, vs.id: vs}.values():
                 upsert_user(session, m)
             u1 = session.get(User, user.id)
             u2 = session.get(User, vs.id)
             w, l = wl_for(u1.id, u2.id)
-            g_label = g.name if g else "All Games"
-            s_label = f", Season: {season}" if season else ""
             await interaction.followup.send(
-                f"**Head-to-Head** {g_label}{s_label}\n{u1.display_name} vs {u2.display_name}: **{w}–{l}**",
-                ephemeral=True
+                f"**Head-to-Head** {g_label}{s_label}\n{u1.display_name} vs {u2.display_name}: **{w}–{l}**"
             )
+
         elif user:
             upsert_user(session, user)
             u = session.get(User, user.id)
             w, l = wl_for(u.id, None)
-            g_label = g.name if g else "All Games"
-            s_label = f", Season: {season}" if season else ""
             await interaction.followup.send(
-                f"**Record** ({g_label}{s_label}) for **{u.display_name}**: **{w}–{l}**",
-                ephemeral=True
+                f"**Record** ({g_label}{s_label}) for **{u.display_name}**: **{w}–{l}**"
             )
+
         else:
-            # Top 10 leaderboard
+            # Leaderboard (Top 10)
             wins_by = session.execute(
-                select(base_sub.c.winner_id, func.count().label("w")).select_from(base_sub).group_by(base_sub.c.winner_id)
+                select(base_sub.c.winner_id, func.count().label("w"))
+                .select_from(base_sub)
+                .group_by(base_sub.c.winner_id)
             ).all()
             losses_by = session.execute(
-                select(base_sub.c.loser_id, func.count().label("l")).select_from(base_sub).group_by(base_sub.c.loser_id)
+                select(base_sub.c.loser_id, func.count().label("l"))
+                .select_from(base_sub)
+                .group_by(base_sub.c.loser_id)
             ).all()
+
             w_map = {row[0]: row[1] for row in wins_by}
             l_map = {row[0]: row[1] for row in losses_by}
             user_ids = set(w_map.keys()) | set(l_map.keys())
@@ -379,26 +391,29 @@ async def record(
                 l = l_map.get(uid, 0)
                 winp = (w / (w + l)) * 100 if (w + l) > 0 else 0.0
                 rows.append((uid, w, l, winp))
+
+            # Sort: wins desc, losses asc, win% desc
             rows.sort(key=lambda r: (-r[1], r[2], -r[3]))
             rows = rows[:10]
 
             if not rows:
-                await interaction.followup.send("No matches recorded yet for that scope.", ephemeral=True)
+                await interaction.followup.send(f"No matches recorded yet for that scope ({g_label}{s_label}).")
             else:
                 lines = []
                 for i, (uid, w, l, wp) in enumerate(rows, 1):
                     u = session.get(User, uid)
                     name = u.display_name if u else str(uid)
                     lines.append(f"{i}. **{name}** — {w}–{l} ({wp:.0f}%)")
-                g_label = g.name if g else "All Games"
-                s_label = f" — Season: {season}" if season else ""
-                await interaction.followup.send(f"**Top 10 — {g_label}{s_label}**\n" + "\n".join(lines), ephemeral=True)
+                s_tag = f" — Season: {season}" if season else ""
+                await interaction.followup.send(f"**Top 10 — {g_label}{s_tag}**\n" + "\n".join(lines))
+
         session.commit()
     except Exception as e:
-        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+        await interaction.followup.send(f"❌ Error: {e}")
     finally:
         session.close()
 
+# Public: convenience alias for H2H
 @bot.tree.command(name="head2head", description="Head-to-head record between two players.")
 @app_commands.describe(game="Game (optional)", user1="Player 1", user2="Player 2", season="Season (optional)")
 async def head2head(
@@ -410,7 +425,7 @@ async def head2head(
 ):
     await record.callback(interaction, game=game, user=user1, vs=user2, season=season)
 
-# ----- New: Leaderboard -----
+# Public: /leaderboard (routes to /record with no users)
 @bot.tree.command(name="leaderboard", description="Show the top 10 players by record.")
 @app_commands.describe(game="Game name/code (optional)", season="Season filter (optional)")
 async def leaderboard(
@@ -499,7 +514,7 @@ async def season_reset(interaction: discord.Interaction, name: str):
     finally:
         session.close()
 
-# ----- New: matchup reset (admin) -----
+# Public: matchup reset (admin-gated, but public success/error)
 @bot.tree.command(name="matchup_reset", description="Admin: reset a head-to-head to 0–0 for a game (optional season).")
 @app_commands.describe(
     user1="Player 1",
@@ -514,18 +529,20 @@ async def matchup_reset(
     game: str,
     season: Optional[str] = None
 ):
+    # If a non-admin runs it, the error is public as requested
     try:
         require_admin(interaction)
     except Exception as e:
-        return await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+        return await interaction.response.send_message(f"❌ {e}")
 
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()  # public
+
     session = SessionLocal()
     try:
         g = get_or_create_game(session, game)
         s = find_active_season(session, season, g) if season else None
 
-        # Ensure users exist in DB (names updated)
+        # Ensure users exist / names updated
         for m in {user1.id: user1, user2.id: user2}.values():
             upsert_user(session, m)
 
@@ -540,7 +557,6 @@ async def matchup_reset(
         if s:
             q = q.filter(Match.season_id == s.id)
 
-        # Soft-reset: mark as voided so history is preserved but excluded from stats
         count = 0
         for m in q.all():
             m.voided = True
@@ -555,17 +571,15 @@ async def matchup_reset(
         label = f"{g.name}" + (f" — {s.name}" if s else "")
         await interaction.followup.send(
             f"🧹 Reset head-to-head for **{user1.display_name}** vs **{user2.display_name}** in **{label}**. "
-            f"Voided **{count}** matches. Now 0–0.",
-            ephemeral=True
+            f"Voided **{count}** matches. Now 0–0."
         )
     except Exception as e:
         session.rollback()
-        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+        await interaction.followup.send(f"❌ Error: {e}")
     finally:
         session.close()
 
 # ----- Undo -----
-
 @bot.tree.command(name="undo", description="Undo your last report (within 10 minutes).")
 async def undo(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -590,6 +604,7 @@ async def undo(interaction: discord.Interaction):
     finally:
         session.close()
 
+# Public: /help
 @bot.tree.command(name="help", description="How to use the scoreboard bot")
 async def help_cmd(interaction: discord.Interaction):
     text = (
@@ -615,12 +630,12 @@ async def help_cmd(interaction: discord.Interaction):
         "• **/season_reset** `name:<name>`\n\n"
 
         "### ℹ️ Notes\n"
+        "• Match, stats, **and matchup resets** post **publicly**.\n"
         "• Game names are case/whitespace-insensitive (e.g., `Madden`, `madden`, `M a d d e n` are the same).\n"
         "• Add `[game]` and/or `[season]` to narrow stats (e.g., `game:madden season:Fall2025`).\n"
-        "• Replies are **ephemeral** by default.\n"
         "• Admins are the user IDs in the bot config (`ADMINS`).\n"
     )
-    await interaction.response.send_message(text, ephemeral=True)
+    await interaction.response.send_message(text)
 
 # ----- Run -----
 def _looks_like_bot_token(t: str) -> bool:
