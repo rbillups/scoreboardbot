@@ -17,7 +17,7 @@ from sqlalchemy.orm import declarative_base, relationship, sessionmaker, scoped_
 # ------------- Config -------------
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("GUILD_ID")  # optional, speeds up first sync for one server
+GUILD_ID = os.getenv("GUILD_ID")  # optional, speeds up slash-command sync for one server
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMINS", "").split(",") if x.strip().isdigit()}
 
 # Use minimal intents (no privileged ones needed for slash commands)
@@ -28,12 +28,15 @@ Base = declarative_base()
 
 DB_URL = os.getenv("DATABASE_URL")  # set on Heroku
 if DB_URL:
-    # Heroku provides a full URL, psycopg3 handles SSL via the URL
+    # Normalize Heroku URL + ensure SSL
+    if DB_URL.startswith("postgres://"):
+        DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
+    if "sslmode=" not in DB_URL:
+        DB_URL += ("&" if "?" in DB_URL else "?") + "sslmode=require"
     engine = create_engine(DB_URL, echo=False, future=True)
 else:
     engine = create_engine("sqlite:///records.db", echo=False, future=True)
 
-# ⬇️ Add this:
 SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False, autocommit=False))
 
 def now_utc():
@@ -97,14 +100,29 @@ Base.metadata.create_all(engine)
 
 # ------------- Helpers -------------
 def upsert_user(session, member: discord.abc.User) -> User:
+    """Create or update a User row, safely handling multiple references to the same user in one transaction."""
+    # Prefer display_name/global_name if available, else fall back to name
+    name = getattr(member, "display_name", None) or getattr(member, "global_name", None) or member.name
+
+    # 1) Query identity map / DB
     u = session.get(User, member.id)
-    if not u:
-        u = User(id=member.id, display_name=getattr(member, "display_name", member.name))
+
+    # 2) If not found, check pending new objects in this session (prevents duplicate INSERTs)
+    if u is None:
+        for obj in session.new:
+            if isinstance(obj, User) and obj.id == member.id:
+                u = obj
+                break
+
+    # 3) Create if still missing; flush so the PK is registered and future lookups work
+    if u is None:
+        u = User(id=member.id, display_name=name)
         session.add(u)
+        session.flush([u])
     else:
-        new_name = getattr(member, "display_name", member.name)
-        if new_name and u.display_name != new_name:
-            u.display_name = new_name
+        if name and u.display_name != name:
+            u.display_name = name
+
     return u
 
 def get_or_create_game(session, name_or_code: Optional[str]) -> Optional[Game]:
@@ -180,6 +198,14 @@ class RecordsBot(commands.Bot):
 
 bot = RecordsBot()
 
+@bot.event
+async def on_ready():
+    print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
+    try:
+        await bot.change_presence(activity=discord.Game(name="/help"))
+    except Exception:
+        pass
+
 # ----- Slash Commands -----
 
 @bot.tree.command(name="report", description="Record a match result (win/loss).")
@@ -208,9 +234,20 @@ async def report(
 
     try:
         g = get_or_create_game(session, game)
-        u_reporter = upsert_user(session, interaction.user)
-        u_winner = upsert_user(session, winner)
-        u_loser = upsert_user(session, loser)
+
+        # Deduplicate reporter/winner/loser to avoid duplicate INSERTs in one txn
+        unique_members = {
+            interaction.user.id: interaction.user,
+            winner.id: winner,
+            loser.id: loser,
+        }
+        for m in unique_members.values():
+            upsert_user(session, m)
+
+        # Now fetch the three rows reliably
+        u_reporter = session.get(User, interaction.user.id)
+        u_winner   = session.get(User, winner.id)
+        u_loser    = session.get(User, loser.id)
 
         # If both scores provided and appear reversed, auto-correct.
         if score_w is not None and score_l is not None and score_w < score_l:
@@ -233,7 +270,10 @@ async def report(
             dupe_of=dupe if dupe else None
         )
         session.add(m)
-        session.add(AuditLog(who_id=u_reporter.id, action=f"report match {u_winner.display_name} vs {u_loser.display_name} in {g.short_code}"))
+        session.add(AuditLog(
+            who_id=u_reporter.id,
+            action=f"report match {u_winner.display_name} vs {u_loser.display_name} in {g.short_code}"
+        ))
         session.commit()
 
         label = f"{g.name}" + (f" — {s.name}" if s else "")
@@ -288,18 +328,32 @@ async def record(
             return wins or 0, losses or 0
 
         if user and vs:
-            u1 = upsert_user(session, user)
-            u2 = upsert_user(session, vs)
+            # Dedupe potential duplicates (in case user==vs)
+            unique_members = {}
+            unique_members[user.id] = user
+            unique_members[vs.id] = vs
+            for m in unique_members.values():
+                upsert_user(session, m)
+
+            u1 = session.get(User, user.id)
+            u2 = session.get(User, vs.id)
             w, l = wl_for(u1.id, u2.id)
             g_label = g.name if g else "All Games"
             s_label = f", Season: {season}" if season else ""
-            await interaction.followup.send(f"**Head-to-Head** {g_label}{s_label}\n{u1.display_name} vs {u2.display_name}: **{w}–{l}**", ephemeral=True)
+            await interaction.followup.send(
+                f"**Head-to-Head** {g_label}{s_label}\n{u1.display_name} vs {u2.display_name}: **{w}–{l}**",
+                ephemeral=True
+            )
         elif user:
-            u = upsert_user(session, user)
+            upsert_user(session, user)
+            u = session.get(User, user.id)
             w, l = wl_for(u.id, None)
             g_label = g.name if g else "All Games"
             s_label = f", Season: {season}" if season else ""
-            await interaction.followup.send(f"**Record** ({g_label}{s_label}) for **{u.display_name}**: **{w}–{l}**", ephemeral=True)
+            await interaction.followup.send(
+                f"**Record** ({g_label}{s_label}) for **{u.display_name}**: **{w}–{l}**",
+                ephemeral=True
+            )
         else:
             base = stmt
             wins_by = session.execute(
@@ -480,9 +534,11 @@ async def help_cmd(interaction: discord.Interaction):
     )
     await interaction.response.send_message(text, ephemeral=True)
 
-
 # ----- Run -----
+def _looks_like_bot_token(t: str) -> bool:
+    return isinstance(t, str) and t.count(".") == 2 and len(t) > 50
+
 if __name__ == "__main__":
-    if not TOKEN:
-        raise RuntimeError("DISCORD_TOKEN missing. Put it in your .env")
+    if not TOKEN or not _looks_like_bot_token(TOKEN):
+        raise RuntimeError("DISCORD_TOKEN seems invalid or missing. Use the Bot tab token (three dot-separated parts).")
     bot.run(TOKEN)
