@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -10,13 +12,9 @@ from dotenv import load_dotenv
 
 from sqlalchemy import (
     Column, Integer, String, DateTime, Boolean,
-    ForeignKey, create_engine, func, select, and_, or_
-)
-from sqlalchemy.orm import declarative_base, relationship, sessionmaker, scoped_session
-from sqlalchemy import (
-    Column, Integer, String, DateTime, Boolean,
     ForeignKey, create_engine, func, select, and_, or_, BigInteger, event
 )
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker, scoped_session
 
 # ------------- Config -------------
 load_dotenv()
@@ -27,7 +25,7 @@ ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMINS", "").split(",") if x.str
 # Use minimal intents (no privileged ones needed for slash commands)
 INTENTS = discord.Intents.default()
 
-# ------------- DB Setup -------------
+# ------------- DB Setup (SQLite only) -------------
 Base = declarative_base()
 
 # Always use SQLite; on Heroku the only writable place is /tmp
@@ -51,9 +49,10 @@ SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False, autocom
 def now_utc():
     return datetime.now(timezone.utc)
 
+# ------------- Models -------------
 class User(Base):
     __tablename__ = "users"
-    id = Column(BigInteger, primary_key=True)  # Discord user ID
+    id = Column(BigInteger, primary_key=True)  # Discord user ID (64-bit)
     display_name = Column(String, nullable=False)
     created_at = Column(DateTime, default=now_utc)
 
@@ -220,6 +219,23 @@ async def on_ready():
         await bot.change_presence(activity=discord.Game(name="/help"))
     except Exception:
         pass
+
+# ----- Error handler & healthcheck -----
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: Exception):
+    import traceback
+    traceback.print_exc()
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(f"❌ Command error: {error}", ephemeral=True)
+        else:
+            await interaction.followup.send(f"❌ Command error: {error}", ephemeral=True)
+    except Exception:
+        pass
+
+@bot.tree.command(name="ping", description="Health check")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message("pong", ephemeral=True)
 
 # ----- Slash Commands -----
 
@@ -445,7 +461,6 @@ async def leaderboard(
     await record.callback(interaction, game=game, user=None, vs=None, season=season)
 
 # ----- Seasons -----
-
 def require_admin(interaction: discord.Interaction):
     if not is_admin(interaction.user.id):
         raise PermissionError("Admin only.")
