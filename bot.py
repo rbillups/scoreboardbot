@@ -24,35 +24,26 @@ ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMINS", "").split(",") if x.str
 # Use minimal intents (no privileged ones needed for slash commands)
 INTENTS = discord.Intents.default()
 
+from sqlalchemy import text
+
 # ------------- DB Setup -------------
 Base = declarative_base()
 
-from sqlalchemy import text
+# Always use an ephemeral SQLite DB on Heroku (resets on dyno restart)
+DB_PATH = os.getenv("SQLITE_PATH", "/tmp/records.db")
+engine = create_engine(
+    f"sqlite:///{DB_PATH}",
+    future=True,
+    connect_args={"check_same_thread": False},  # SQLite + threads
+)
 
-DB_URL = os.getenv("DATABASE_URL", "")
-
-if DB_URL:
-    # Normalize scheme and force psycopg v3 driver
-    if DB_URL.startswith("postgres://"):
-        DB_URL = DB_URL.replace("postgres://", "postgresql+psycopg://", 1)
-    elif DB_URL.startswith("postgresql://"):
-        DB_URL = DB_URL.replace("postgresql://", "postgresql+psycopg://", 1)
-
-    url = make_url(DB_URL)
-    q = dict(url.query)
-    q.setdefault("sslmode", "require")
-    url = url.set(query=q)
-
-    # Log where we're connecting (no secrets)
-    print(f"DB -> host={url.host} db={url.database} user={url.username}")
-
-    engine = create_engine(url, future=True, pool_pre_ping=True)
-
-    # Preflight (fail fast with clear logs)
-    with engine.connect() as conn:
-        conn.execute(text("select 1"))
-else:
-    engine = create_engine("sqlite:///records.db", echo=False, future=True)
+# Enforce foreign keys on SQLite
+from sqlalchemy import event
+@event.listens_for(engine, "connect")
+def _fk_pragma(dbapi_conn, _):
+    cur = dbapi_conn.cursor()
+    cur.execute("PRAGMA foreign_keys=ON")
+    cur.close()
 
 SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False, autocommit=False))
 
@@ -84,7 +75,7 @@ class Season(Base):
 
 class Match(Base):
     __tablename__ = "matches"
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
     game_id = Column(Integer, ForeignKey("games.id"), nullable=False)
     season_id = Column(Integer, ForeignKey("seasons.id"), nullable=True)
 
@@ -108,8 +99,8 @@ class Match(Base):
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    who_id = Column(Integer, nullable=False)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    who_id = Column(BigInteger, nullable=False)
     action = Column(String, nullable=False)
     created_at = Column(DateTime, default=now_utc)
 
