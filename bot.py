@@ -2,13 +2,12 @@ import os
 import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
-from sqlalchemy import BigInteger
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
-from sqlalchemy.engine import make_url
+
 from sqlalchemy import (
     Column, Integer, String, DateTime, Boolean,
     ForeignKey, create_engine, func, select, and_, or_
@@ -24,26 +23,19 @@ ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMINS", "").split(",") if x.str
 # Use minimal intents (no privileged ones needed for slash commands)
 INTENTS = discord.Intents.default()
 
-from sqlalchemy import text
-
 # ------------- DB Setup -------------
 Base = declarative_base()
 
-# Always use an ephemeral SQLite DB on Heroku (resets on dyno restart)
-DB_PATH = os.getenv("SQLITE_PATH", "/tmp/records.db")
-engine = create_engine(
-    f"sqlite:///{DB_PATH}",
-    future=True,
-    connect_args={"check_same_thread": False},  # SQLite + threads
-)
-
-# Enforce foreign keys on SQLite
-from sqlalchemy import event
-@event.listens_for(engine, "connect")
-def _fk_pragma(dbapi_conn, _):
-    cur = dbapi_conn.cursor()
-    cur.execute("PRAGMA foreign_keys=ON")
-    cur.close()
+DB_URL = os.getenv("DATABASE_URL")  # set on Heroku
+if DB_URL:
+    # Normalize Heroku URL + ensure SSL
+    if DB_URL.startswith("postgres://"):
+        DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
+    if "sslmode=" not in DB_URL:
+        DB_URL += ("&" if "?" in DB_URL else "?") + "sslmode=require"
+    engine = create_engine(DB_URL, echo=False, future=True)
+else:
+    engine = create_engine("sqlite:///records.db", echo=False, future=True)
 
 SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False, autocommit=False))
 
@@ -52,7 +44,7 @@ def now_utc():
 
 class User(Base):
     __tablename__ = "users"
-    id = Column(BigInteger, primary_key=True)  # Discord user ID
+    id = Column(Integer, primary_key=True)  # Discord user ID
     display_name = Column(String, nullable=False)
     created_at = Column(DateTime, default=now_utc)
 
@@ -79,9 +71,9 @@ class Match(Base):
     game_id = Column(Integer, ForeignKey("games.id"), nullable=False)
     season_id = Column(Integer, ForeignKey("seasons.id"), nullable=True)
 
-    reporter_id = Column(BigInteger, ForeignKey("users.id"), nullable=False)
-    winner_id = Column(BigInteger, ForeignKey("users.id"), nullable=False)
-    loser_id = Column(BigInteger, ForeignKey("users.id"), nullable=False)
+    reporter_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    winner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    loser_id = Column(Integer, ForeignKey("users.id"), nullable=False)
 
     score_w = Column(Integer, nullable=True)
     score_l = Column(Integer, nullable=True)
@@ -100,7 +92,7 @@ class Match(Base):
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    who_id = Column(BigInteger, nullable=False)
+    who_id = Column(Integer, nullable=False)
     action = Column(String, nullable=False)
     created_at = Column(DateTime, default=now_utc)
 
