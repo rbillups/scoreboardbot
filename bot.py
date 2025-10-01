@@ -2,6 +2,7 @@ import os
 import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
+from sqlalchemy import BigInteger
 
 import discord
 from discord import app_commands
@@ -60,7 +61,7 @@ def now_utc():
 
 class User(Base):
     __tablename__ = "users"
-    id = Column(Integer, primary_key=True)  # Discord user ID
+    id = Column(BigInteger, primary_key=True)  # Discord user ID
     display_name = Column(String, nullable=False)
     created_at = Column(DateTime, default=now_utc)
 
@@ -83,13 +84,13 @@ class Season(Base):
 
 class Match(Base):
     __tablename__ = "matches"
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
     game_id = Column(Integer, ForeignKey("games.id"), nullable=False)
     season_id = Column(Integer, ForeignKey("seasons.id"), nullable=True)
 
-    reporter_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    winner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    loser_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    reporter_id = Column(BigInteger, ForeignKey("users.id"), nullable=False)
+    winner_id = Column(BigInteger, ForeignKey("users.id"), nullable=False)
+    loser_id = Column(BigInteger, ForeignKey("users.id"), nullable=False)
 
     score_w = Column(Integer, nullable=True)
     score_l = Column(Integer, nullable=True)
@@ -107,7 +108,7 @@ class Match(Base):
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
     who_id = Column(Integer, nullable=False)
     action = Column(String, nullable=False)
     created_at = Column(DateTime, default=now_utc)
