@@ -262,7 +262,9 @@ async def report(
 
         s = find_active_season(session, season, g) if season else None
 
+        # Silent dupe check (log only)
         dupe = dupe_match_exists(session, g.id, u_winner.id, u_loser.id)
+
         m = Match(
             game_id=g.id,
             season_id=s.id if s else None,
@@ -276,17 +278,19 @@ async def report(
             dupe_of=dupe if dupe else None
         )
         session.add(m)
-        session.add(AuditLog(
-            who_id=u_reporter.id,
-            action=f"report match {u_winner.display_name} vs {u_loser.display_name} in {g.short_code}"
-        ))
+
+        # Audit log includes dupe reference if applicable; no user-facing banner.
+        action = f"report match {u_winner.display_name} vs {u_loser.display_name} in {g.short_code}"
+        if dupe:
+            action += f" [dupe_of:{dupe}]"
+        session.add(AuditLog(who_id=u_reporter.id, action=action))
+
         session.commit()
 
         label = f"{g.name}" + (f" — {s.name}" if s else "")
         score_txt = f" {m.score_w}-{m.score_l}" if (m.score_w is not None and m.score_l is not None) else ""
-        dupe_txt = " (⚠️ possible duplicate)" if dupe else ""
         await interaction.followup.send(
-            f"✅ Recorded: **{u_winner.display_name}** beat **{u_loser.display_name}**{score_txt} in **{label}**. Match ID: `{m.id}`{dupe_txt}",
+            f"✅ Recorded: **{u_winner.display_name}** beat **{u_loser.display_name}**{score_txt} in **{label}**. Match ID: `{m.id}`",
             ephemeral=True
         )
     except Exception as e:
@@ -592,25 +596,29 @@ async def help_cmd(interaction: discord.Interaction):
         "## 🏆 Scoreboard Bot Help\n"
         "**Track head-to-head games, keep records, and run seasons in your server.**\n"
         "Use slash commands (`/command`).\n\n"
+
         "### 🎮 Match Commands\n"
         "• **/report** `game:<name> winner:@User loser:@User [score_w] [score_l] [season]`\n"
         "  Record a result. Example:\n"
         "  `/report game:madden winner:@Key loser:@Cam score_w:21 score_l:17 season:Fall2025`\n"
-        "• **/record** `[game] [user] [vs] [season]` — leaderboards, player record, or head-to-head\n"
+        "• **/record** `[game] [user] [vs] [season]` — player record, head-to-head, or top list\n"
         "• **/head2head** `user1:@User user2:@User [game] [season]` — quick H2H\n"
-        "• **/leaderboard** `[game] [season]` — top 10\n\n"
+        "• **/leaderboard** `[game] [season]` — top 10 by wins (ties break by losses, then win%)\n\n"
+
         "### 🧹 Admin Utilities\n"
         "• **/undo** — players: undo your last report (10 min). Admins: undo latest match.\n"
-        "• **/matchup_reset** `user1:@User user2:@User game:<name> [season]` — reset a rivalry to 0–0 for a game.\n\n"
+        "• **/matchup_reset** `user1:@User user2:@User game:<name> [season]` — reset a rivalry to **0–0** for a game.\n\n"
+
         "### 📅 Seasons (Admin Only)\n"
         "• **/season_start** `name:<name> [game]`\n"
         "• **/season_end** `name:<name>`\n"
         "• **/season_reset** `name:<name>`\n\n"
+
         "### ℹ️ Notes\n"
-        "• Game names are case-insensitive and whitespace-insensitive (e.g., `Madden`, `madden`, `M a d d e n` are the same).\n"
+        "• Game names are case/whitespace-insensitive (e.g., `Madden`, `madden`, `M a d d e n` are the same).\n"
+        "• Add `[game]` and/or `[season]` to narrow stats (e.g., `game:madden season:Fall2025`).\n"
         "• Replies are **ephemeral** by default.\n"
         "• Admins are the user IDs in the bot config (`ADMINS`).\n"
-        "• Quick dupe-detection flags back-to-back identical reports.\n"
     )
     await interaction.response.send_message(text, ephemeral=True)
 
