@@ -13,6 +13,10 @@ from sqlalchemy import (
     ForeignKey, create_engine, func, select, and_, or_
 )
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker, scoped_session
+from sqlalchemy import (
+    Column, Integer, String, DateTime, Boolean,
+    ForeignKey, create_engine, func, select, and_, or_, BigInteger, event
+)
 
 # ------------- Config -------------
 load_dotenv()
@@ -26,16 +30,21 @@ INTENTS = discord.Intents.default()
 # ------------- DB Setup -------------
 Base = declarative_base()
 
-DB_URL = os.getenv("DATABASE_URL")  # set on Heroku
-if DB_URL:
-    # Normalize Heroku URL + ensure SSL
-    if DB_URL.startswith("postgres://"):
-        DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
-    if "sslmode=" not in DB_URL:
-        DB_URL += ("&" if "?" in DB_URL else "?") + "sslmode=require"
-    engine = create_engine(DB_URL, echo=False, future=True)
-else:
-    engine = create_engine("sqlite:///records.db", echo=False, future=True)
+# Always use SQLite; on Heroku the only writable place is /tmp
+DB_PATH = "/tmp/records.db" if os.getenv("DYNO") else "records.db"
+engine = create_engine(
+    f"sqlite:///{DB_PATH}",
+    echo=False,
+    future=True,
+    connect_args={"check_same_thread": False},
+)
+
+# Enforce foreign keys in SQLite
+@event.listens_for(engine, "connect")
+def _fk_on(dbapi_conn, _):
+    cur = dbapi_conn.cursor()
+    cur.execute("PRAGMA foreign_keys=ON")
+    cur.close()
 
 SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False, autocommit=False))
 
@@ -44,7 +53,7 @@ def now_utc():
 
 class User(Base):
     __tablename__ = "users"
-    id = Column(Integer, primary_key=True)  # Discord user ID
+    id = Column(BigInteger, primary_key=True)  # Discord user ID
     display_name = Column(String, nullable=False)
     created_at = Column(DateTime, default=now_utc)
 
@@ -71,9 +80,9 @@ class Match(Base):
     game_id = Column(Integer, ForeignKey("games.id"), nullable=False)
     season_id = Column(Integer, ForeignKey("seasons.id"), nullable=True)
 
-    reporter_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    winner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    loser_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    reporter_id = Column(BigInteger, ForeignKey("users.id"), nullable=False)
+    winner_id = Column(BigInteger, ForeignKey("users.id"), nullable=False)
+    loser_id = Column(BigInteger, ForeignKey("users.id"), nullable=False)
 
     score_w = Column(Integer, nullable=True)
     score_l = Column(Integer, nullable=True)
@@ -92,7 +101,7 @@ class Match(Base):
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    who_id = Column(Integer, nullable=False)
+    who_id = Column(BigInteger, nullable=False)
     action = Column(String, nullable=False)
     created_at = Column(DateTime, default=now_utc)
 
