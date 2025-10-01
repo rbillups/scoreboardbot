@@ -26,30 +26,31 @@ INTENTS = discord.Intents.default()
 # ------------- DB Setup -------------
 Base = declarative_base()
 
-DB_URL = os.getenv("DATABASE_URL")  # set by Heroku
+from sqlalchemy import text
+
+DB_URL = os.getenv("DATABASE_URL", "")
 
 if DB_URL:
-    # Convert legacy/postgres URLs to psycopg v3 driver
+    # Normalize scheme and force psycopg v3 driver
     if DB_URL.startswith("postgres://"):
-        DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
+        DB_URL = DB_URL.replace("postgres://", "postgresql+psycopg://", 1)
+    elif DB_URL.startswith("postgresql://"):
+        DB_URL = DB_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
     url = make_url(DB_URL)
-    # Force psycopg v3 driver if none/psycopg2 was implied
-    if url.get_backend_name() == "postgresql" and url.get_driver_name() in (None, "", "psycopg2"):
-        url = url.set(drivername="postgresql+psycopg")
+    q = dict(url.query)
+    q.setdefault("sslmode", "require")
+    url = url.set(query=q)
 
-    # Ensure SSL on Heroku
-    query = dict(url.query)
-    if query.get("sslmode") is None:
-        query["sslmode"] = "require"
-    url = url.set(query=query)
+    # Log where we're connecting (no secrets)
+    print(f"DB -> host={url.host} db={url.database} user={url.username}")
 
-    DB_URL = str(url)
-    engine = create_engine(DB_URL, echo=False, future=True)
+    engine = create_engine(url, future=True, pool_pre_ping=True)
+
+    # Preflight (fail fast with clear logs)
+    with engine.connect() as conn:
+        conn.execute(text("select 1"))
 else:
-    # Guard: don’t silently use SQLite on Heroku dynos
-    if os.getenv("DYNO"):
-        raise RuntimeError("On Heroku but DATABASE_URL is missing. Add Heroku Postgres.")
     engine = create_engine("sqlite:///records.db", echo=False, future=True)
 
 SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False, autocommit=False))
